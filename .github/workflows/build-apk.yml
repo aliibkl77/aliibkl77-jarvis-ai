@@ -1,0 +1,59 @@
+name: Build Jarvis Mark VII APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Build Tools & Platform 33
+        run: |
+          sdkmanager "platforms;android-33" "build-tools;33.0.2"
+
+      - name: Compile and Sign APK
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/33.0.2"
+          PLATFORM="$ANDROID_HOME/platforms/android-33/android.jar"
+          mkdir -p build/classes build/gen
+
+          "$BUILD_TOOLS/aapt2" compile --dir res -o build/res.zip
+          "$BUILD_TOOLS/aapt2" link -o build/unaligned.apk -I "$PLATFORM" --manifest AndroidManifest.xml build/res.zip --java build/gen
+
+          javac -source 1.8 -target 1.8 -bootclasspath "$PLATFORM" -d build/classes $(find src build/gen -name "*.java")
+
+          "$BUILD_TOOLS/d8" --lib "$PLATFORM" --output build/ $(find build/classes -name "*.class")
+
+          cd build && zip -u unaligned.apk classes.dex && cd ..
+          "$BUILD_TOOLS/zipalign" -f 4 build/unaligned.apk build/aligned.apk
+
+          keytool -genkeypair -keystore build/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Ali,O=Jarvis,C=TR"
+          "$BUILD_TOOLS/apksigner" sign --ks build/debug.keystore --ks-pass pass:android --out Jarvis.apk build/aligned.apk
+
+      - name: Publish Release with Jarvis.apk
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Jarvis Mark VII (Son Surum)
+          files: Jarvis.apk
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
