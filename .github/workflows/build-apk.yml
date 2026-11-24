@@ -21,17 +21,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Build Tools & Platform 33
-        run: |
-          sdkmanager "platforms;android-33" "build-tools;33.0.2"
-
       - name: Compile and Sign APK
         run: |
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/33.0.2"
-          PLATFORM="$ANDROID_HOME/platforms/android-33/android.jar"
+          SDK_DIR="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          BUILD_TOOLS=$(ls -d "$SDK_DIR/build-tools/"* | sort -V | tail -n 1)
+          PLATFORM=$(ls -d "$SDK_DIR/platforms/android-"* | sort -V | tail -n 1)/android.jar
+
           mkdir -p build/classes build/gen
 
           "$BUILD_TOOLS/aapt2" compile --dir res -o build/res.zip
