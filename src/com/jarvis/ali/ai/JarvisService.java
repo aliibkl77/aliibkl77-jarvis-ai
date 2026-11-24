@@ -947,4 +947,203 @@ public class JarvisService extends AccessibilityService {
             List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
             int count = 0;
             for (ApplicationInfo app : apps) {
-                if (pm.getLaunchIntentForPa
+                             if (pm.getLaunchIntentForPackage(app.packageName) == null) continue;
+                String label = pm.getApplicationLabel(app).toString();
+                String lLower = label.toLowerCase(new Locale("tr", "TR"));
+                if (goalLower.contains(lLower) || lLower.contains("whatsapp") || lLower.contains("youtube") || lLower.contains("instagram")) {
+                    sb.append("- ").append(label).append(" (").append(app.packageName).append(")\n");
+                    count++;
+                    if (count >= 10) break;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return sb.toString();
+    }
+
+    private String buildAgentPrompt(String goal, int step, int maxSteps, String contacts, String apps, List<String> history, String screen) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("KİMLİK VE ÜSLUP:\n");
+        if (!TextUtils.isEmpty(dynamicBrainRules)) {
+            sb.append(dynamicBrainRules).append("\n");
+        } else {
+            sb.append("Sen Ali'nin özel otonom yapay zekası J.A.R.V.I.S. Mark VII'sin. Samimi, kanka/Ali hitaplı, pratik ve zeki konuş.\n");
+        }
+        sb.append("\nOTONOM GÖREV PROTOKOLÜ (ADIM ").append(step).append("/").append(maxSteps).append("):\n");
+        sb.append("Kullanıcının ana hedefi: \"").append(goal).append("\"\n");
+        sb.append("Rehber İpuçları:\n").append(contacts).append("\n");
+        sb.append("Yüklü Uygulama İpuçları:\n").append(apps).append("\n");
+
+        if (!history.isEmpty()) {
+            sb.append("ŞU ANA KADAR YAPILAN ADIMLAR:\n");
+            for (String h : history) {
+                sb.append(h).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        sb.append(screen).append("\n");
+        sb.append("KURALLAR:\n");
+        sb.append("1. Ekrandaki mevcut duruma bakarak hedefe ulaşmak için SADECE BİR SONRAKİ EN MANTIKLI ADIMI seç.\n");
+        sb.append("2. WhatsApp'ta mesaj atarken: Önce WhatsApp'ı aç (OPEN_APP: com.whatsapp), kişi listede görünüyorsa direkt tıkla (CLICK_NODE), görünmüyorsa Ara butonuna tıkla, arama kutusuna rehberdeki tam ismi yaz (TYPE_NODE), çıkan sohbete tıkla, mesaj kutusuna metni yaz (TYPE_NODE), sonra Gönder butonuna tıkla (CLICK_NODE) ve done=true yap!\n");
+        sb.append("3. Ara adımlarda 'speech' alanını boş string \"\" bırak; sadece göreve başlarken veya görev tamamen bittiğinde (done=true) Ali'ye kısa bir sesli bilgi ver.\n");
+        sb.append("4. SADECE aşağıdaki geçerli JSON formatında yanıt ver:\n");
+        sb.append("{\"thought\":\"kısa düşünce\",\"speech\":\"\",\"action\":\"OPEN_APP|CLICK_NODE|TYPE_NODE|TAP_XY|SCROLL_DOWN|SCROLL_UP|PRESS_ENTER|BACK|HOME|CALL_NUMBER|OPEN_URL|SYSTEM_CMD|WAIT|DONE\",\"target\":\"indeks veya paket adı\",\"text\":\"yazılacak metin\",\"done\":false}");
+        return sb.toString();
+    }
+
+    private String callGeminiJson(String apiKey, String promptText) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(25000);
+            conn.setDoOutput(true);
+
+            JSONObject part = new JSONObject();
+            part.put("text", promptText);
+            JSONArray parts = new JSONArray();
+            parts.put(part);
+            JSONObject content = new JSONObject();
+            content.put("parts", parts);
+            JSONArray contents = new JSONArray();
+            contents.put(content);
+
+            JSONObject genConfig = new JSONObject();
+            genConfig.put("temperature", 0.15);
+            genConfig.put("responseMimeType", "application/json");
+
+            JSONObject root = new JSONObject();
+            root.put("contents", contents);
+            root.put("generationConfig", genConfig);
+
+            OutputStream os = conn.getOutputStream();
+            os.write(root.toString().getBytes("UTF-8"));
+            os.close();
+
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+            StringBuilder resp = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                resp.append(line);
+            }
+            reader.close();
+
+            if (code >= 200 && code < 300) {
+                JSONObject jsonResp = new JSONObject(resp.toString());
+                JSONArray candidates = jsonResp.optJSONArray("candidates");
+                if (candidates != null && candidates.length() > 0) {
+                    JSONObject cand0 = candidates.getJSONObject(0);
+                    JSONObject cObj = cand0.optJSONObject("content");
+                    if (cObj != null) {
+                        JSONArray pArr = cObj.optJSONArray("parts");
+                        if (pArr != null && pArr.length() > 0) {
+                            return pArr.getJSONObject(0).optString("text", "");
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        return null;
+    }
+
+    public void syncBrainAndCheckUpdate(final boolean notifyUser) {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                String repo = prefs.getString("github_repo", "aliibkl77/aliibkl77-jarvis-ai").trim();
+                if (TextUtils.isEmpty(repo)) return;
+
+                try {
+                    URL brainUrl = new URL("https://raw.githubusercontent.com/" + repo + "/main/brain.txt");
+                    HttpURLConnection c = (HttpURLConnection) brainUrl.openConnection();
+                    c.setConnectTimeout(8000);
+                    if (c.getResponseCode() == 200) {
+                        BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                        StringBuilder sb = new StringBuilder();
+                        String l;
+                        while ((l = br.readLine()) != null) sb.append(l).append("\n");
+                        br.close();
+                        dynamicBrainRules = sb.toString().trim();
+                    }
+                    c.disconnect();
+                } catch (Exception ignored) {
+                }
+
+                try {
+                    URL relUrl = new URL("https://api.github.com/repos/" + repo + "/releases/latest");
+                    HttpURLConnection c = (HttpURLConnection) relUrl.openConnection();
+                    c.setRequestProperty("Accept", "application/vnd.github.v3+json");
+                    c.setConnectTimeout(8000);
+                    if (c.getResponseCode() == 200) {
+                        BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                        StringBuilder sb = new StringBuilder();
+                        String l;
+                        while ((l = br.readLine()) != null) sb.append(l);
+                        br.close();
+
+                        JSONObject rel = new JSONObject(sb.toString());
+                        String publishedAt = rel.optString("published_at", "");
+                        String lastKnown = prefs.getString("last_release_ts", "");
+                        JSONArray assets = rel.optJSONArray("assets");
+                        String apkUrl = "";
+                        if (assets != null) {
+                            for (int i = 0; i < assets.length(); i++) {
+                                JSONObject a = assets.getJSONObject(i);
+                                if ("Jarvis.apk".equals(a.optString("name"))) {
+                                    apkUrl = a.optString("browser_download_url", "");
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!TextUtils.isEmpty(apkUrl) && !publishedAt.equals(lastKnown)) {
+                            prefs.edit().putString("last_release_ts", publishedAt).apply();
+                            emitLog("JARVIS", "Yeni Jarvis.apk sürümü bulundu! İndirme başlatılıyor Ali...");
+                            speak("Yeni güncelleme bulundu Ali, indiriyorum.");
+                            downloadApkWithSystemManager(apkUrl);
+                        } else if (notifyUser) {
+                            emitLog("JARVIS", "Beyin (brain.txt) senkronize edildi. Şu an en güncel Mark VII sürümündesin kanka.");
+                            speak("Sistem zaten en güncel sürümde Ali.");
+                        }
+                    }
+                    c.disconnect();
+                } catch (Exception e) {
+                    if (notifyUser) {
+                        emitLog("JARVIS", "Güncelleme kontrolü sırasında bağlantı sağlanamadı.");
+                    }
+                }
+            }
+        });
+    }
+
+    private void downloadApkWithSystemManager(final String downloadUrl) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    DownloadManager.Request req = new DownloadManager.Request(Uri.parse(downloadUrl));
+                    req.setTitle("J.A.R.V.I.S. Mark VII Güncellemesi");
+                    req.setDescription("Jarvis.apk indiriliyor...");
+                    req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                    req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "Jarvis-Update.apk");
+                    DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                    if (dm != null) {
+                        dm.enqueue(req);
+                        Toast.makeText(JarvisService.this, "Jarvis-Update.apk Download klasörüne indiriliyor!", Toast.LENGTH_LONG).show();
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+    }
+                    
