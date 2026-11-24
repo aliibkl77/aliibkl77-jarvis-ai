@@ -651,7 +651,7 @@ public class JarvisService extends AccessibilityService {
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(i);
             } else if ("whatsapp".equals(cmd)) {
-                String[] p = param.split("\|", 2);
+                String[] p = param.split("\\|", 2);
                 String url = "https://api.whatsapp.com/send?phone=" + p[0].trim() + "&text=" + URLEncoder.encode(p.length > 1 ? p[1].trim() : "", "UTF-8");
                 Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
