@@ -519,6 +519,432 @@ public class JarvisService extends AccessibilityService {
         }
         return false;
     }
-
+    
     private void runClosedLoopAgent(String userGoal) {
-  
+        String apiKey = prefs.getString("gemini_api_key", "").trim();
+        if (TextUtils.isEmpty(apiKey)) {
+            updateState(ArcReactorView.STATE_ERROR, "API KEY EKSİK", "Ayarlardan Gemini API Key gir Ali");
+            emitLog("JARVIS", "Ayarlardan Gemini API Key girmen lazım Ali.");
+            isAutonomousRunning = false;
+            return;
+        }
+
+        String contactHints = resolveRelevantContacts(userGoal);
+        String appHints = resolveRelevantApps(userGoal);
+        List<String> stepHistory = new ArrayList<String>();
+
+        int maxSteps = 14;
+        for (int step = 1; step <= maxSteps; step++) {
+            if (!isAutonomousRunning) break;
+
+            updateState(ArcReactorView.STATE_AUTONOMOUS, "ADIM " + step + "/" + maxSteps + " ANALİZ...", userGoal);
+
+            String screenContext = captureScreenStateBlocking();
+            String prompt = buildAgentPrompt(userGoal, step, maxSteps, contactHints, appHints, stepHistory, screenContext);
+
+            String rawJson = callGeminiJson(apiKey, prompt);
+            if (!isAutonomousRunning) break;
+
+            if (TextUtils.isEmpty(rawJson)) {
+                updateState(ArcReactorView.STATE_ERROR, "BAĞLANTI HATASI", "Gemini sunucusuna ulaşılamadı");
+                emitLog("JARVIS", "İnternet veya API bağlantısında kopukluk oldu kanka, tekrar dene.");
+                speak("Bağlantı hatası oldu Ali.");
+                break;
+            }
+
+            try {
+                JSONObject obj = new JSONObject(rawJson);
+                String thought = obj.optString("thought", "");
+                String speech = obj.optString("speech", "");
+                String action = obj.optString("action", "DONE").toUpperCase(Locale.US);
+                String target = obj.optString("target", "");
+                String text = obj.optString("text", "");
+                boolean done = obj.optBoolean("done", false);
+
+                if (!TextUtils.isEmpty(thought)) {
+                    emitLog("STEP", "Adım " + step + " [" + action + "]: " + thought);
+                    updateState(ArcReactorView.STATE_AUTONOMOUS, "ADIM " + step + ": " + action, thought);
+                }
+
+                if (!TextUtils.isEmpty(speech)) {
+                    emitLog("JARVIS", speech);
+                    speak(speech);
+                }
+
+                if ("DONE".equals(action)) {
+                    break;
+                }
+
+                String execResult = executeSingleAction(action, target, text);
+                stepHistory.add("Adım " + step + " -> " + action + "(" + target + ", '" + text + "') => " + execResult);
+
+                if (done) {
+                    break;
+                }
+
+                long waitMs = "OPEN_APP".equals(action) ? 1900L :
+                              "WAIT".equals(action) ? 2000L : 1150L;
+                Thread.sleep(waitMs);
+
+            } catch (Exception e) {
+                stepHistory.add("Adım " + step + " JSON ayrıştırma hatası: " + e.getMessage());
+            }
+        }
+
+        isAutonomousRunning = false;
+        updateState(ArcReactorView.STATE_IDLE, "SİSTEM HAZIR", "Görev tamamlandı • Emrini bekliyorum Ali");
+        if (continuousWakeMode) {
+            startListening();
+        }
+    }
+
+    private String captureScreenStateBlocking() {
+        final String[] resultHolder = new String[]{"EKRAN OKUNAMADI"};
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    lastScreenNodes.clear();
+                    AccessibilityNodeInfo root = getRootInActiveWindow();
+                    if (root == null) {
+                        resultHolder[0] = "AKTİF PENCERE YOK (Geçiş yapılıyor)";
+                        return;
+                    }
+                    CharSequence pkg = root.getPackageName();
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("AÇIK UYGULAMA PAKETİ: ").append(pkg != null ? pkg.toString() : "bilinmiyor").append("\n");
+                    sb.append("EKRANDAKİ ETKİLEŞİMLİ ÖĞELER:\n");
+
+                    collectNodesRecursive(root, sb, 0);
+                    resultHolder[0] = sb.toString();
+                } catch (Exception e) {
+                    resultHolder[0] = "EKRAN OKUMA HATASI: " + e.getMessage();
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+
+        try {
+            latch.await(2500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+        }
+        return resultHolder[0];
+    }
+
+    private void collectNodesRecursive(AccessibilityNodeInfo node, StringBuilder sb, int depth) {
+        if (node == null || depth > 22 || lastScreenNodes.size() >= 85) return;
+
+        if (node.isVisibleToUser()) {
+            Rect bounds = new Rect();
+            node.getBoundsInScreen(bounds);
+            if (bounds.width() > 0 && bounds.height() > 0) {
+                String text = node.getText() != null ? node.getText().toString().trim() : "";
+                String desc = node.getContentDescription() != null ? node.getContentDescription().toString().trim() : "";
+                String viewId = node.getViewIdResourceName() != null ? node.getViewIdResourceName() : "";
+                if (viewId.contains("/")) {
+                    viewId = viewId.substring(viewId.lastIndexOf('/') + 1);
+                }
+                boolean clickable = node.isClickable();
+                boolean editable = node.isEditable();
+                boolean scrollable = node.isScrollable();
+
+                if (!text.isEmpty() || !desc.isEmpty() || clickable || editable || scrollable) {
+                    int idx = lastScreenNodes.size();
+                    String cls = node.getClassName() != null ? node.getClassName().toString() : "View";
+                    if (cls.contains(".")) {
+                        cls = cls.substring(cls.lastIndexOf('.') + 1);
+                    }
+
+                    StringBuilder line = new StringBuilder();
+                    line.append("[").append(idx).append("] ").append(cls);
+                    if (!text.isEmpty()) line.append(" text=\"").append(text.replace("\n", " ")).append("\"");
+                    if (!desc.isEmpty()) line.append(" desc=\"").append(desc.replace("\n", " ")).append("\"");
+                    if (!viewId.isEmpty()) line.append(" id=").append(viewId);
+                    if (clickable) line.append(" [TIKLANABİLİR]");
+                    if (editable) line.append(" [YAZILABİLİR]");
+                    if (scrollable) line.append(" [KAYDIRILABİLİR]");
+                    line.append(" (").append(bounds.centerX()).append(",").append(bounds.centerY()).append(")\n");
+
+                    NodeEntry entry = new NodeEntry();
+                    entry.index = idx;
+                    entry.node = node;
+                    entry.summary = line.toString();
+                    entry.cx = bounds.centerX();
+                    entry.cy = bounds.centerY();
+                    lastScreenNodes.add(entry);
+                    sb.append(entry.summary);
+                }
+            }
+        }
+
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            collectNodesRecursive(node.getChild(i), sb, depth + 1);
+        }
+    }
+
+    private String executeSingleAction(final String action, final String target, final String text) {
+        final String[] res = new String[]{"OK"};
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if ("OPEN_APP".equals(action)) {
+                        boolean launched = launchAppSmart(target);
+                        res[0] = launched ? "Uygulama açıldı: " + target : "Uygulama bulunamadı: " + target;
+                    } else if ("CLICK_NODE".equals(action)) {
+                        int idx = Integer.parseInt(target.trim());
+                        if (idx >= 0 && idx < lastScreenNodes.size()) {
+                            NodeEntry entry = lastScreenNodes.get(idx);
+                            boolean clicked = performSmartClick(entry);
+                            res[0] = clicked ? "Tıklandı: [" + idx + "]" : "Tıklama başarısız: [" + idx + "]";
+                        } else {
+                            res[0] = "Geçersiz düğüm indeksi: " + target;
+                        }
+                    } else if ("TYPE_NODE".equals(action)) {
+                        int idx = Integer.parseInt(target.trim());
+                        if (idx >= 0 && idx < lastScreenNodes.size()) {
+                            NodeEntry entry = lastScreenNodes.get(idx);
+                            boolean typed = performSmartType(entry, text);
+                            res[0] = typed ? "Yazıldı: '" + text + "'" : "Yazma başarısız";
+                        } else {
+                            res[0] = "Geçersiz metin kutusu indeksi: " + target;
+                        }
+                    } else if ("TAP_XY".equals(action)) {
+                        String[] parts = target.split(",");
+                        int x = Integer.parseInt(parts[0].trim());
+                        int y = Integer.parseInt(parts[1].trim());
+                        performGestureTap(x, y);
+                        res[0] = "Koordinata dokunuldu: (" + x + "," + y + ")";
+                    } else if ("SCROLL_DOWN".equals(action)) {
+                        performSmartScroll(true);
+                        res[0] = "Aşağı kaydırıldı";
+                    } else if ("SCROLL_UP".equals(action)) {
+                        performSmartScroll(false);
+                        res[0] = "Yukarı kaydırıldı";
+                    } else if ("PRESS_ENTER".equals(action)) {
+                        performImeEnterOrSend();
+                        res[0] = "Enter/Gönder tetiklendi";
+                    } else if ("BACK".equals(action)) {
+                        performGlobalAction(GLOBAL_ACTION_BACK);
+                        res[0] = "Geri tuşuna basıldı";
+                    } else if ("HOME".equals(action)) {
+                        performGlobalAction(GLOBAL_ACTION_HOME);
+                        res[0] = "Ana ekrana dönüldü";
+                    } else if ("CALL_NUMBER".equals(action)) {
+                        Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + target.trim()));
+                        callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(callIntent);
+                        res[0] = "Arama başlatıldı: " + target;
+                    } else if ("OPEN_URL".equals(action)) {
+                        String u = target.startsWith("http") ? target : "https://" + target;
+                        Intent urlIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+                        urlIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(urlIntent);
+                        res[0] = "URL açıldı: " + u;
+                    } else if ("SYSTEM_CMD".equals(action)) {
+                        handleSystemCmd(target);
+                        res[0] = "Sistem komutu uygulandı: " + target;
+                    } else {
+                        res[0] = "Beklendi";
+                    }
+                } catch (Exception e) {
+                    res[0] = "Hata: " + e.getMessage();
+                } finally {
+                    latch.countDown();
+                }
+            }
+        });
+
+        try {
+            latch.await(3000, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+        }
+        return res[0];
+    }
+
+    private boolean performSmartClick(NodeEntry entry) {
+        AccessibilityNodeInfo current = entry.node;
+        for (int i = 0; i < 5 && current != null; i++) {
+            if (current.isClickable() && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return true;
+            }
+            current = current.getParent();
+        }
+        performGestureTap(entry.cx, entry.cy);
+        return true;
+    }
+
+    private boolean performSmartType(NodeEntry entry, String text) {
+        performSmartClick(entry);
+        AccessibilityNodeInfo node = entry.node;
+        if (node != null) {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            Bundle args = new Bundle();
+            args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+            if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                return true;
+            }
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("jarvis_input", text));
+                return node.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+            }
+        }
+        return false;
+    }
+
+    private void performImeEnterOrSend() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                AccessibilityNodeInfo focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                if (focused != null) {
+                    focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId());
+                }
+            }
+        }
+    }
+
+    private void performSmartScroll(boolean forward) {
+        for (NodeEntry entry : lastScreenNodes) {
+            if (entry.node != null && entry.node.isScrollable()) {
+                int act = forward ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD;
+                if (entry.node.performAction(act)) return;
+            }
+        }
+        int width = getResources().getDisplayMetrics().widthPixels;
+        int height = getResources().getDisplayMetrics().heightPixels;
+        int x = width / 2;
+        int startY = forward ? (int) (height * 0.72) : (int) (height * 0.32);
+        int endY = forward ? (int) (height * 0.28) : (int) (height * 0.72);
+        performGestureSwipe(x, startY, x, endY, 320);
+    }
+
+    private void performGestureTap(int x, int y) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return;
+        Path path = new Path();
+        path.moveTo(x, y);
+        GestureDescription.StrokeDescription stroke = new GestureDescription.StrokeDescription(path, 0, 60);
+        GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
+        dispatchGesture(gesture, null, null);
+    }
+
+    private void performGestureSwipe(int x1, int y1, int x2, int y2, long durationMs) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return;
+        Path path = new Path();
+        path.moveTo(x1, y1);
+        path.lineTo(x2, y2);
+        GestureDescription.StrokeDescription stroke = new GestureDescription.StrokeDescription(path, 0, durationMs);
+        GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
+        dispatchGesture(gesture, null, null);
+    }
+
+    private boolean launchAppSmart(String query) {
+        PackageManager pm = getPackageManager();
+        if (query.contains(".")) {
+            Intent direct = pm.getLaunchIntentForPackage(query.trim());
+            if (direct != null) {
+                direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(direct);
+                return true;
+            }
+        }
+
+        String qLower = query.toLowerCase(new Locale("tr", "TR")).trim();
+        if (qLower.contains("whatsapp")) {
+            Intent wa = pm.getLaunchIntentForPackage("com.whatsapp");
+            if (wa != null) {
+                wa.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(wa);
+                return true;
+            }
+        }
+
+        List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
+        for (ApplicationInfo app : apps) {
+            Intent launch = pm.getLaunchIntentForPackage(app.packageName);
+            if (launch == null) continue;
+            String label = pm.getApplicationLabel(app).toString().toLowerCase(new Locale("tr", "TR"));
+            if (label.equals(qLower) || label.contains(qLower) || qLower.contains(label)) {
+                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(launch);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void handleSystemCmd(String cmd) {
+        String c = cmd.toUpperCase(Locale.US);
+        if (c.contains("FLASH_ON")) setFlashlight(true);
+        else if (c.contains("FLASH_OFF")) setFlashlight(false);
+        else if (c.contains("VOL_MAX")) {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (am != null) am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0);
+        } else if (c.contains("VOL_MUTE")) {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (am != null) am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+        }
+    }
+
+    private void setFlashlight(boolean enable) {
+        try {
+            CameraManager cm = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            if (cm != null && cm.getCameraIdList().length > 0) {
+                cm.setTorchMode(cm.getCameraIdList()[0], enable);
+                torchOn = enable;
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String resolveRelevantContacts(String userGoal) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                checkSelfPermission(android.Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return "Rehber izni kapalı.";
+        }
+        StringBuilder sb = new StringBuilder();
+        Cursor cursor = null;
+        try {
+            String goalLower = userGoal.toLowerCase(new Locale("tr", "TR"));
+            cursor = getContentResolver().query(
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    new String[]{
+                            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                            ContactsContract.CommonDataKinds.Phone.NUMBER
+                    },
+                    null, null, null
+            );
+            int found = 0;
+            while (cursor != null && cursor.moveToNext() && found < 6) {
+                String name = cursor.getString(0);
+                String num = cursor.getString(1);
+                if (TextUtils.isEmpty(name)) continue;
+                String nameLower = name.toLowerCase(new Locale("tr", "TR"));
+                if (goalLower.contains(nameLower) || (nameLower.length() >= 3 && goalLower.contains(nameLower.substring(0, nameLower.length() - 1)))) {
+                    sb.append("- Rehber Kaydı: \"").append(name).append("\" (Tel: ").append(num).append(")\n");
+                    found++;
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        return sb.length() > 0 ? sb.toString() : "Doğrudan isim eşleşmesi bulunamadı.";
+    }
+
+    private String resolveRelevantApps(String userGoal) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            PackageManager pm = getPackageManager();
+            String goalLower = userGoal.toLowerCase(new Locale("tr", "TR"));
+            List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
+            int count = 0;
+            for (ApplicationInfo app : apps) {
+                if (pm.getLaunchIntentForPa
